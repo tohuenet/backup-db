@@ -121,6 +121,39 @@ def log_exception(context: str, exc: BaseException) -> None:
     log_message(traceback.format_exc(), "ERROR")
 
 
+def console_msg(message: str) -> None:
+    """Print a progress line to the terminal (immediate feedback for the user)."""
+    print(f"[dbbackup] {message}", file=sys.stderr, flush=True)
+
+
+def run_subprocess(
+    command: List[str],
+    show_progress: bool = True,
+    step: str = "",
+) -> subprocess.CompletedProcess:
+    """
+    Run a subprocess. When show_progress is True, inherit the terminal so the
+    user can see apt/curl output instead of a silent hang.
+    """
+    if step and show_progress:
+        console_msg(step)
+    if show_progress:
+        return subprocess.run(command, check=False)
+    return subprocess.run(command, check=False, capture_output=True, text=True)
+
+
+def ensure_interactive_terminal() -> bool:
+    """Verify stdin/stdout are TTYs (required for whiptail menus)."""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        if not os.environ.get("TERM"):
+            os.environ["TERM"] = "linux"
+        return True
+    console_msg("ERROR: Interactive mode requires a real terminal (TTY).")
+    console_msg("If using SSH, connect with: ssh -t user@host")
+    console_msg("Then run: sudo python3 /opt/dbbackup/dbbackup.py")
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Whiptail UI helpers
 # ---------------------------------------------------------------------------
@@ -401,7 +434,7 @@ def mongodb_repo_configured() -> bool:
     return any(sources_dir.glob("mongodb-org-*.list"))
 
 
-def ensure_mongodb_apt_repo() -> bool:
+def ensure_mongodb_apt_repo(show_progress: bool = True) -> bool:
     """
     Add MongoDB 7.0 official apt repository for Ubuntu.
 
@@ -427,10 +460,15 @@ def ensure_mongodb_apt_repo() -> bool:
             ("ca-certificates", "ca-certificates"),
         ):
             if not command_exists(command) and not package_installed(package):
-                subprocess.run(
-                    ["apt-get", "install", "-y", "-qq", package],
-                    check=True,
+                result = run_subprocess(
+                    ["apt-get", "install", "-y", package],
+                    show_progress=show_progress,
+                    step=f"Installing helper package: {package}...",
                 )
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, "apt-get")
+        if show_progress:
+            console_msg("Adding MongoDB GPG key...")
         subprocess.run(
             [
                 "bash",
@@ -442,6 +480,8 @@ def ensure_mongodb_apt_repo() -> bool:
         )
         MONGODB_REPO_LIST.write_text(repo_line, encoding="utf-8")
         log_message(f"Added MongoDB apt repository ({codename})")
+        if show_progress:
+            console_msg(f"MongoDB apt repository added ({codename}/mongodb-org/7.0)")
         return True
     except (OSError, subprocess.CalledProcessError) as exc:
         log_exception("Failed to configure MongoDB apt repository", exc)
@@ -464,7 +504,7 @@ def mongodb_deb_download_url() -> Optional[str]:
     )
 
 
-def install_mongodb_tools_from_deb() -> bool:
+def install_mongodb_tools_from_deb(show_progress: bool = True) -> bool:
     """Fallback installer using official MongoDB .deb package."""
     url = mongodb_deb_download_url()
     if not url:
@@ -472,17 +512,24 @@ def install_mongodb_tools_from_deb() -> bool:
         return False
 
     log_message(f"Installing MongoDB tools from .deb: {url}")
+    if show_progress:
+        console_msg("Downloading MongoDB database tools (.deb)...")
     with tempfile.TemporaryDirectory(prefix="dbbackup_mongo_deb_") as temp_dir:
         deb_path = Path(temp_dir) / "mongodb-database-tools.deb"
         try:
-            subprocess.run(
-                ["curl", "-fsSL", "-o", str(deb_path), url],
-                check=True,
+            result = run_subprocess(
+                ["curl", "-fSL", "-o", str(deb_path), url],
+                show_progress=show_progress,
             )
-            subprocess.run(
-                ["apt-get", "install", "-y", "-qq", str(deb_path)],
-                check=True,
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, "curl")
+            result = run_subprocess(
+                ["apt-get", "install", "-y", str(deb_path)],
+                show_progress=show_progress,
+                step="Installing MongoDB database tools from .deb...",
             )
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, "apt-get")
         except subprocess.CalledProcessError as exc:
             log_exception("MongoDB .deb installation failed", exc)
             return False
@@ -494,7 +541,7 @@ def install_mongodb_tools_from_deb() -> bool:
     return False
 
 
-def install_mongodb_tools() -> bool:
+def install_mongodb_tools(show_progress: bool = True) -> bool:
     """Install mongodump/mongosh via MongoDB apt repo or .deb fallback."""
     if mongodb_tools_available():
         return True
@@ -504,31 +551,46 @@ def install_mongodb_tools() -> bool:
         return False
 
     if not mongodb_repo_configured():
-        if not ensure_mongodb_apt_repo():
-            return install_mongodb_tools_from_deb()
+        if show_progress:
+            console_msg("Configuring MongoDB official apt repository...")
+        if not ensure_mongodb_apt_repo(show_progress=show_progress):
+            return install_mongodb_tools_from_deb(show_progress=show_progress)
 
     try:
-        subprocess.run(["apt-get", "update", "-qq"], check=True)
-        subprocess.run(
-            ["apt-get", "install", "-y", "-qq"] + MONGODB_APT_PACKAGES,
-            check=True,
+        result = run_subprocess(
+            ["apt-get", "update"],
+            show_progress=show_progress,
+            step="Updating apt cache (MongoDB repository)...",
         )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, "apt-get update")
+        result = run_subprocess(
+            ["apt-get", "install", "-y"] + MONGODB_APT_PACKAGES,
+            show_progress=show_progress,
+            step="Installing mongodb-database-tools and mongodb-mongosh...",
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, "apt-get install")
     except subprocess.CalledProcessError as exc:
         log_message(
             f"MongoDB apt install failed, trying .deb fallback: {exc}",
             "WARNING",
         )
-        return install_mongodb_tools_from_deb()
+        if show_progress:
+            console_msg("MongoDB apt install failed, trying .deb fallback...")
+        return install_mongodb_tools_from_deb(show_progress=show_progress)
 
     if mongodb_tools_available():
         log_message("MongoDB database tools installed via apt")
+        if show_progress:
+            console_msg("MongoDB database tools installed successfully.")
         return True
 
     log_message("MongoDB apt install completed but mongodump not found", "WARNING")
-    return install_mongodb_tools_from_deb()
+    return install_mongodb_tools_from_deb(show_progress=show_progress)
 
 
-def install_dependencies(force_prompt: bool = True) -> bool:
+def install_dependencies(force_prompt: bool = True, show_progress: bool = True) -> bool:
     """
     Detect and install missing required packages via apt.
     Requires root privileges.
@@ -545,6 +607,8 @@ def install_dependencies(force_prompt: bool = True) -> bool:
     needs_mongodb = not mongodb_tools_available()
 
     if not missing_packages and not needs_mongodb:
+        if show_progress:
+            console_msg("All dependencies are already installed.")
         return True
 
     if os.geteuid() != 0:
@@ -565,16 +629,34 @@ def install_dependencies(force_prompt: bool = True) -> bool:
         f"Installing packages: {missing_packages}"
         + (" + MongoDB tools" if needs_mongodb else "")
     )
-    try:
-        subprocess.run(["apt-get", "update", "-qq"], check=True)
+    if show_progress:
+        console_msg("Checking and installing required packages...")
         if missing_packages:
-            subprocess.run(
-                ["apt-get", "install", "-y", "-qq"] + missing_packages,
-                check=True,
+            console_msg(f"Missing Ubuntu packages: {', '.join(missing_packages)}")
+        if needs_mongodb:
+            console_msg("Missing MongoDB tools: mongodb-database-tools, mongodb-mongosh")
+        console_msg("Please wait — apt operations can take several minutes.")
+    try:
+        result = run_subprocess(
+            ["apt-get", "update"],
+            show_progress=show_progress,
+            step="Updating apt package lists...",
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, "apt-get update")
+        if missing_packages:
+            result = run_subprocess(
+                ["apt-get", "install", "-y"] + missing_packages,
+                show_progress=show_progress,
+                step=f"Installing: {', '.join(missing_packages)}...",
             )
-        if needs_mongodb and not install_mongodb_tools():
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, "apt-get install")
+        if needs_mongodb and not install_mongodb_tools(show_progress=show_progress):
             raise subprocess.CalledProcessError(1, "install_mongodb_tools")
         log_message("Package installation completed")
+        if show_progress:
+            console_msg("Dependency installation finished.")
         return True
     except subprocess.CalledProcessError as exc:
         log_exception("Package installation failed", exc)
@@ -2119,11 +2201,25 @@ def install_scheduler() -> None:
 
 def main_menu() -> None:
     """Display interactive whiptail main menu loop."""
-    if not whiptail_available():
-        print("whiptail is not installed. Run with root to install dependencies.")
+    console_msg("DBBackup - Enterprise Database Backup Manager")
+    console_msg(f"Config: {CONFIG_FILE} | Log: {LOG_FILE}")
+
+    if not ensure_interactive_terminal():
         sys.exit(1)
 
-    install_dependencies(force_prompt=True)
+    if not whiptail_available():
+        console_msg("whiptail is not installed. Installing dependencies...")
+        if os.geteuid() != 0:
+            console_msg("Run with sudo to install whiptail automatically.")
+            sys.exit(1)
+
+    console_msg("Checking dependencies (may take a few minutes on first run)...")
+    install_dependencies(force_prompt=True, show_progress=True)
+    console_msg("Opening menu...")
+
+    if not whiptail_available():
+        console_msg("ERROR: whiptail is still not available after install.")
+        sys.exit(1)
 
     while True:
         choice = menu(
@@ -2193,14 +2289,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
     if args.install_deps:
-        return 0 if install_dependencies(force_prompt=False) else 1
+        console_msg("DBBackup dependency installer")
+        ok = install_dependencies(force_prompt=False, show_progress=True)
+        if ok:
+            console_msg("Done. All dependencies are installed.")
+        else:
+            console_msg("Failed. See log: /opt/dbbackup/logs/dbbackup.log")
+        return 0 if ok else 1
 
     if args.run_scheduled:
-        install_dependencies(force_prompt=False)
+        install_dependencies(force_prompt=False, show_progress=False)
         return run_all_backups()
 
     if args.run_job:
-        install_dependencies(force_prompt=False)
+        install_dependencies(force_prompt=False, show_progress=False)
         if not acquire_lock():
             print("Backup already running.", file=sys.stderr)
             return 1

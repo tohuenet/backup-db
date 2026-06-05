@@ -53,13 +53,32 @@ DB_TYPES = {
     "mongodb": "MongoDB",
 }
 
-REQUIRED_PACKAGES = {
+APT_PACKAGES = {
     "python3": "python3",
     "whiptail": "whiptail",
     "pg_dump": "postgresql-client",
     "mysqldump": "mysql-client",
-    "mongodump": "mongodb-database-tools",
     "gzip": "gzip",
+}
+
+# MongoDB tools are not in Ubuntu default repos; installed via MongoDB apt repo.
+MONGODB_APT_PACKAGES = ["mongodb-database-tools", "mongodb-mongosh"]
+
+MONGODB_REPO_KEYRING = Path("/usr/share/keyrings/mongodb-server-7.0.gpg")
+MONGODB_REPO_LIST = Path("/etc/apt/sources.list.d/mongodb-org-7.0.list")
+
+# Pinned fallback .deb when apt repository setup is unavailable.
+MONGODB_DEB_VERSION = "100.10.0"
+MONGODB_DEB_ARCH = {
+    "x86_64": "x86_64",
+    "amd64": "x86_64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
+MONGODB_UBUNTU_RELEASE = {
+    "jammy": "2204",
+    "focal": "2004",
+    "noble": "2404",
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -353,13 +372,169 @@ def package_installed(package: str) -> bool:
         return False
 
 
+def detect_ubuntu_codename() -> Optional[str]:
+    """Return Ubuntu release codename (e.g. jammy) or None if not Ubuntu."""
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as handle:
+            data: Dict[str, str] = {}
+            for line in handle:
+                if "=" in line:
+                    key, value = line.strip().split("=", 1)
+                    data[key] = value.strip('"')
+        if data.get("ID") != "ubuntu":
+            return None
+        return data.get("VERSION_CODENAME") or None
+    except OSError:
+        return None
+
+
+def mongodb_tools_available() -> bool:
+    """Return True if mongodump is installed and usable."""
+    return command_exists("mongodump")
+
+
+def mongodb_repo_configured() -> bool:
+    """Return True if a MongoDB apt source list is present."""
+    sources_dir = Path("/etc/apt/sources.list.d")
+    if not sources_dir.is_dir():
+        return False
+    return any(sources_dir.glob("mongodb-org-*.list"))
+
+
+def ensure_mongodb_apt_repo() -> bool:
+    """
+    Add MongoDB 7.0 official apt repository for Ubuntu.
+
+    mongodb-database-tools is not shipped in Ubuntu default repositories.
+    """
+    if MONGODB_REPO_LIST.exists():
+        return True
+
+    codename = detect_ubuntu_codename() or "jammy"
+    repo_line = (
+        f"deb [ arch=amd64,arm64 signed-by={MONGODB_REPO_KEYRING} ] "
+        f"https://repo.mongodb.org/apt/ubuntu {codename}/mongodb-org/7.0 multiverse\n"
+    )
+
+    try:
+        subprocess.run(
+            ["install", "-d", "-m", "0755", "/usr/share/keyrings"],
+            check=True,
+        )
+        for command, package in (
+            ("curl", "curl"),
+            ("gpg", "gnupg"),
+            ("ca-certificates", "ca-certificates"),
+        ):
+            if not command_exists(command) and not package_installed(package):
+                subprocess.run(
+                    ["apt-get", "install", "-y", "-qq", package],
+                    check=True,
+                )
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                "curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | "
+                f"gpg --dearmor -o {MONGODB_REPO_KEYRING}",
+            ],
+            check=True,
+        )
+        MONGODB_REPO_LIST.write_text(repo_line, encoding="utf-8")
+        log_message(f"Added MongoDB apt repository ({codename})")
+        return True
+    except (OSError, subprocess.CalledProcessError) as exc:
+        log_exception("Failed to configure MongoDB apt repository", exc)
+        return False
+
+
+def mongodb_deb_download_url() -> Optional[str]:
+    """Build MongoDB database tools .deb download URL for this system."""
+    import platform
+
+    codename = detect_ubuntu_codename() or "jammy"
+    ubuntu_release = MONGODB_UBUNTU_RELEASE.get(codename, "2204")
+    arch = MONGODB_DEB_ARCH.get(platform.machine().lower())
+    if not arch:
+        return None
+    return (
+        "https://fastdl.mongodb.org/tools/db/"
+        f"mongodb-database-tools-ubuntu{ubuntu_release}-{arch}-"
+        f"{MONGODB_DEB_VERSION}.deb"
+    )
+
+
+def install_mongodb_tools_from_deb() -> bool:
+    """Fallback installer using official MongoDB .deb package."""
+    url = mongodb_deb_download_url()
+    if not url:
+        log_message("Unsupported architecture for MongoDB tools .deb fallback", "ERROR")
+        return False
+
+    log_message(f"Installing MongoDB tools from .deb: {url}")
+    with tempfile.TemporaryDirectory(prefix="dbbackup_mongo_deb_") as temp_dir:
+        deb_path = Path(temp_dir) / "mongodb-database-tools.deb"
+        try:
+            subprocess.run(
+                ["curl", "-fsSL", "-o", str(deb_path), url],
+                check=True,
+            )
+            subprocess.run(
+                ["apt-get", "install", "-y", "-qq", str(deb_path)],
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            log_exception("MongoDB .deb installation failed", exc)
+            return False
+
+    if mongodb_tools_available():
+        log_message("MongoDB database tools installed from .deb")
+        return True
+    log_message("mongodump still unavailable after .deb install", "ERROR")
+    return False
+
+
+def install_mongodb_tools() -> bool:
+    """Install mongodump/mongosh via MongoDB apt repo or .deb fallback."""
+    if mongodb_tools_available():
+        return True
+
+    if os.geteuid() != 0:
+        log_message("MongoDB tools install requires root", "WARNING")
+        return False
+
+    if not mongodb_repo_configured():
+        if not ensure_mongodb_apt_repo():
+            return install_mongodb_tools_from_deb()
+
+    try:
+        subprocess.run(["apt-get", "update", "-qq"], check=True)
+        subprocess.run(
+            ["apt-get", "install", "-y", "-qq"] + MONGODB_APT_PACKAGES,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        log_message(
+            f"MongoDB apt install failed, trying .deb fallback: {exc}",
+            "WARNING",
+        )
+        return install_mongodb_tools_from_deb()
+
+    if mongodb_tools_available():
+        log_message("MongoDB database tools installed via apt")
+        return True
+
+    log_message("MongoDB apt install completed but mongodump not found", "WARNING")
+    return install_mongodb_tools_from_deb()
+
+
 def install_dependencies(force_prompt: bool = True) -> bool:
     """
     Detect and install missing required packages via apt.
     Requires root privileges.
     """
     missing_packages: List[str] = []
-    for command, package in REQUIRED_PACKAGES.items():
+    for command, package in APT_PACKAGES.items():
         if command_exists(command):
             continue
         if package_installed(package):
@@ -367,27 +542,38 @@ def install_dependencies(force_prompt: bool = True) -> bool:
         if package not in missing_packages:
             missing_packages.append(package)
 
-    if not missing_packages:
+    needs_mongodb = not mongodb_tools_available()
+
+    if not missing_packages and not needs_mongodb:
         return True
 
     if os.geteuid() != 0:
+        missing_display = list(missing_packages)
+        if needs_mongodb:
+            missing_display.append("mongodb-database-tools (MongoDB repo)")
         if force_prompt:
             msg_box(
                 "Root Required",
                 "Missing packages require root privileges.\n\n"
-                f"Missing: {', '.join(missing_packages)}\n\n"
+                f"Missing: {', '.join(missing_display)}\n\n"
                 "Run: sudo python3 dbbackup.py",
             )
-        log_message(f"Missing packages (no root): {missing_packages}", "WARNING")
+        log_message(f"Missing packages (no root): {missing_display}", "WARNING")
         return False
 
-    log_message(f"Installing packages: {missing_packages}")
+    log_message(
+        f"Installing packages: {missing_packages}"
+        + (" + MongoDB tools" if needs_mongodb else "")
+    )
     try:
         subprocess.run(["apt-get", "update", "-qq"], check=True)
-        subprocess.run(
-            ["apt-get", "install", "-y", "-qq"] + missing_packages,
-            check=True,
-        )
+        if missing_packages:
+            subprocess.run(
+                ["apt-get", "install", "-y", "-qq"] + missing_packages,
+                check=True,
+            )
+        if needs_mongodb and not install_mongodb_tools():
+            raise subprocess.CalledProcessError(1, "install_mongodb_tools")
         log_message("Package installation completed")
         return True
     except subprocess.CalledProcessError as exc:

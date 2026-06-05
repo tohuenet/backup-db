@@ -27,7 +27,7 @@ The application installs missing packages automatically when run as root. To ins
 sudo python3 /opt/dbbackup/dbbackup.py --install-deps
 ```
 
-Packages installed via `apt`:
+Packages from Ubuntu default repositories are installed directly. **MongoDB tools** (`mongodb-database-tools`, `mongodb-mongosh`) are not in Ubuntu default repos; the installer automatically adds the [MongoDB 7.0 official apt repository](https://www.mongodb.com/docs/manual/tutorial/install-mongodb-on-ubuntu/) and falls back to a direct `.deb` download if needed.
 
 | Command    | Package                  |
 |-----------|--------------------------|
@@ -35,7 +35,8 @@ Packages installed via `apt`:
 | whiptail  | whiptail                 |
 | pg_dump   | postgresql-client        |
 | mysqldump | mysql-client             |
-| mongodump | mongodb-database-tools   |
+| mongodump   | mongodb-database-tools (MongoDB official repo) |
+| mongosh     | mongodb-mongosh (MongoDB official repo)       |
 | gzip      | gzip                     |
 
 ### 3. Launch the application

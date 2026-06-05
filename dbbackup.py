@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,7 @@ MONTHLY_DIR = BACKUP_ROOT / "monthly"
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "dbbackup.log"
 LOCK_FILE = BASE_DIR / "dbbackup.lock"
+DEPS_STAMP = BASE_DIR / ".deps_verified"
 
 SYSTEMD_SERVICE = Path("/etc/systemd/system/dbbackup.service")
 SYSTEMD_TIMER = Path("/etc/systemd/system/dbbackup.timer")
@@ -169,20 +171,28 @@ def run_whiptail(args: List[str]) -> Tuple[int, str]:
     Execute whiptail with common backtitle.
 
     Returns (exit_code, selection_or_message).
-    Whiptail writes user selections to stderr.
+
+    Whiptail draws its UI on the terminal (stderr). If stderr is piped during
+    execution, the menu is invisible and the app appears hung. Use the
+    standard fd swap (3>&1 1>&2 2>&3) so output goes to stdout while the
+    dialog renders on the real terminal.
     """
     command = ["whiptail", "--backtitle", APP_TITLE] + args
+    bash_cmd = " ".join(shlex.quote(part) for part in command) + " 3>&1 1>&2 2>&3"
+    env = os.environ.copy()
+    if not env.get("TERM"):
+        env["TERM"] = "linux"
     try:
         result = subprocess.run(
-            command,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            ["bash", "-c", bash_cmd],
+            capture_output=True,
             text=True,
+            env=env,
         )
     except OSError as exc:
         log_exception("whiptail execution failed", exc)
         return 1, ""
-    selection = (result.stderr or result.stdout or "").strip()
+    selection = (result.stdout or "").strip()
     return result.returncode, selection
 
 
@@ -590,6 +600,31 @@ def install_mongodb_tools(show_progress: bool = True) -> bool:
     return install_mongodb_tools_from_deb(show_progress=show_progress)
 
 
+def all_required_commands_available() -> bool:
+    """Quick check: are all external tools present on PATH?"""
+    return all(command_exists(cmd) for cmd in list(APT_PACKAGES.keys()) + ["mongodump"])
+
+
+def mark_deps_verified() -> None:
+    """Record that dependency check succeeded (skip slow re-check on next launch)."""
+    try:
+        ensure_directories()
+        DEPS_STAMP.touch()
+    except OSError:
+        pass
+
+
+def deps_recently_verified(max_age_hours: int = 72) -> bool:
+    """Return True if dependencies were verified recently."""
+    try:
+        if not DEPS_STAMP.exists():
+            return False
+        age_seconds = time.time() - DEPS_STAMP.stat().st_mtime
+        return age_seconds < max_age_hours * 3600
+    except OSError:
+        return False
+
+
 def install_dependencies(force_prompt: bool = True, show_progress: bool = True) -> bool:
     """
     Detect and install missing required packages via apt.
@@ -607,6 +642,7 @@ def install_dependencies(force_prompt: bool = True, show_progress: bool = True) 
     needs_mongodb = not mongodb_tools_available()
 
     if not missing_packages and not needs_mongodb:
+        mark_deps_verified()
         if show_progress:
             console_msg("All dependencies are already installed.")
         return True
@@ -655,6 +691,7 @@ def install_dependencies(force_prompt: bool = True, show_progress: bool = True) 
         if needs_mongodb and not install_mongodb_tools(show_progress=show_progress):
             raise subprocess.CalledProcessError(1, "install_mongodb_tools")
         log_message("Package installation completed")
+        mark_deps_verified()
         if show_progress:
             console_msg("Dependency installation finished.")
         return True
@@ -2199,22 +2236,26 @@ def install_scheduler() -> None:
 # ---------------------------------------------------------------------------
 
 
-def main_menu() -> None:
+def main_menu(skip_deps_check: bool = False) -> None:
     """Display interactive whiptail main menu loop."""
     console_msg("DBBackup - Enterprise Database Backup Manager")
-    console_msg(f"Config: {CONFIG_FILE} | Log: {LOG_FILE}")
 
     if not ensure_interactive_terminal():
         sys.exit(1)
 
     if not whiptail_available():
-        console_msg("whiptail is not installed. Installing dependencies...")
+        console_msg("whiptail not found — installing dependencies...")
         if os.geteuid() != 0:
             console_msg("Run with sudo to install whiptail automatically.")
             sys.exit(1)
+        install_dependencies(force_prompt=True, show_progress=True)
+    elif not skip_deps_check:
+        if not all_required_commands_available():
+            console_msg("Missing tools detected — installing...")
+            install_dependencies(force_prompt=True, show_progress=True)
+        elif not deps_recently_verified():
+            install_dependencies(force_prompt=True, show_progress=False)
 
-    console_msg("Checking dependencies (may take a few minutes on first run)...")
-    install_dependencies(force_prompt=True, show_progress=True)
     console_msg("Opening menu...")
 
     if not whiptail_available():
@@ -2280,6 +2321,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Install missing dependencies and exit",
     )
+    parser.add_argument(
+        "--skip-deps-check",
+        action="store_true",
+        help="Skip dependency check on startup (interactive mode)",
+    )
     return parser.parse_args(argv)
 
 
@@ -2320,7 +2366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             release_lock()
 
     try:
-        main_menu()
+        main_menu(skip_deps_check=args.skip_deps_check)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return 130

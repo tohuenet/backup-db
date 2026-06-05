@@ -1,0 +1,60 @@
+{
+  "telegram": {
+    "enabled": true,
+    "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
+    "chat_id": "987654321"
+  },
+  "jobs": [
+    {
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Production PostgreSQL",
+      "database_type": "postgresql",
+      "host": "db.example.com",
+      "port": 5432,
+      "username": "backup_user",
+      "password": "plaintext_password_here",
+      "backup_all": false,
+      "databases": [
+        "customer",
+        "billing"
+      ],
+      "retention": {
+        "daily_days": 14,
+        "weekly_weeks": 8,
+        "monthly_months": 12
+      }
+    },
+    {
+      "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+      "name": "Remote MySQL",
+      "database_type": "mysql",
+      "host": "mysql.example.com",
+      "port": 3306,
+      "username": "backup_user",
+      "password": "plaintext_password_here",
+      "backup_all": true,
+      "databases": [],
+      "retention": {
+        "daily_days": 14,
+        "weekly_weeks": 8,
+        "monthly_months": 12
+      }
+    },
+    {
+      "id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+      "name": "MongoDB Cluster",
+      "database_type": "mongodb",
+      "host": "mongo.example.com",
+      "port": 27017,
+      "username": "backup_user",
+      "password": "plaintext_password_here",
+      "backup_all": true,
+      "databases": [],
+      "retention": {
+        "daily_days": 14,
+        "weekly_weeks": 8,
+        "monthly_months": 12
+      }
+    }
+  ]
+}

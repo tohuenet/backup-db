@@ -1,0 +1,17 @@
+[Unit]
+Description=DBBackup - Enterprise Database Backup Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/dbbackup/dbbackup.py --run-scheduled
+User=root
+Group=root
+Nice=10
+IOSchedulingClass=best-effort
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

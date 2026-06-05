@@ -10,6 +10,7 @@ timers for scheduling.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -92,6 +93,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "jobs": [],
 }
 
+# Fallback when whiptail cannot access the TTY (common under sudo/SSH).
+TEXT_UI_MODE = False
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -166,38 +170,189 @@ def whiptail_available() -> bool:
     return shutil.which("whiptail") is not None
 
 
-def run_whiptail(args: List[str]) -> Tuple[int, str]:
+def open_controlling_tty():
     """
-    Execute whiptail with common backtitle.
+    Open the controlling terminal (/dev/tty).
 
-    Returns (exit_code, selection_or_message).
-
-    Whiptail draws its UI on the terminal (stderr). If stderr is piped during
-    execution, the menu is invisible and the app appears hung. Use the
-    standard fd swap (3>&1 1>&2 2>&3) so output goes to stdout while the
-    dialog renders on the real terminal.
+    Required when running under sudo — sys.stdin/stdout may not be the TTY
+    that whiptail must draw on, which causes invisible dialogs and apparent hangs.
     """
-    command = ["whiptail", "--backtitle", APP_TITLE] + args
-    bash_cmd = " ".join(shlex.quote(part) for part in command) + " 3>&1 1>&2 2>&3"
+    try:
+        return open("/dev/tty", "r+b", buffering=0)
+    except OSError:
+        return None
+
+
+def whiptail_supports_output_fd() -> bool:
+    """Detect whether this whiptail build supports --output-fd."""
+    try:
+        result = subprocess.run(
+            ["whiptail", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return "--output-fd" in f"{result.stdout}\n{result.stderr}"
+    except OSError:
+        return False
+
+
+_WHIPTAIL_OUTPUT_FD: Optional[bool] = None
+
+
+def run_whiptail(args: List[str], timeout: int = 0) -> Tuple[int, str]:
+    """
+    Execute whiptail and return (exit_code, selection).
+
+    Uses --output-fd with /dev/tty so the dialog is visible even under sudo.
+    Falls back to the bash fd-swap method without capturing stderr.
+    """
+    global _WHIPTAIL_OUTPUT_FD
+    if _WHIPTAIL_OUTPUT_FD is None:
+        _WHIPTAIL_OUTPUT_FD = whiptail_supports_output_fd()
+
+    tty = open_controlling_tty()
+    stdin = tty if tty is not None else sys.stdin
+    stdout = tty if tty is not None else sys.stdout
+    stderr = tty if tty is not None else sys.stderr
+
     env = os.environ.copy()
-    if not env.get("TERM"):
-        env["TERM"] = "linux"
+    env.setdefault("TERM", "xterm-256color")
+    env.setdefault("LANG", "C.UTF-8")
+
+    base_args = ["--backtitle", APP_TITLE] + args
+
+    try:
+        if _WHIPTAIL_OUTPUT_FD:
+            return _run_whiptail_output_fd(
+                base_args, stdin, stdout, stderr, env, timeout, tty
+            )
+        return _run_whiptail_fd_swap(
+            base_args, stdin, stdout, stderr, env, timeout, tty
+        )
+    finally:
+        if tty is not None:
+            tty.close()
+
+
+def _run_whiptail_output_fd(
+    args: List[str],
+    stdin,
+    stdout,
+    stderr,
+    env: Dict[str, str],
+    timeout: int,
+    tty,
+) -> Tuple[int, str]:
+    """Run whiptail with --output-fd (recommended; works with sudo)."""
+    read_fd, write_fd = os.pipe()
+    command = ["whiptail", "--output-fd", str(write_fd)] + args
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            env=env,
+            pass_fds=(write_fd,),
+            close_fds=True,
+        )
+    except OSError as exc:
+        os.close(read_fd)
+        os.close(write_fd)
+        log_exception("whiptail Popen failed", exc)
+        return 1, ""
+    os.close(write_fd)
+    output_chunks: List[bytes] = []
+    try:
+        while True:
+            try:
+                chunk = os.read(read_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output_chunks.append(chunk)
+    finally:
+        os.close(read_fd)
+
+    try:
+        returncode = proc.wait(timeout=timeout if timeout > 0 else None)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        log_message("whiptail timed out (UI may be invisible — check TTY/sudo)", "ERROR")
+        return 1, ""
+
+    selection = b"".join(output_chunks).decode("utf-8", errors="replace").strip()
+    return returncode, selection
+
+
+def _run_whiptail_fd_swap(
+    args: List[str],
+    stdin,
+    stdout,
+    stderr,
+    env: Dict[str, str],
+    timeout: int,
+    tty,
+) -> Tuple[int, str]:
+    """Fallback for older whiptail without --output-fd."""
+    command = ["whiptail"] + args
+    bash_cmd = " ".join(shlex.quote(part) for part in command) + " 3>&1 1>&2 2>&3"
     try:
         result = subprocess.run(
             ["bash", "-c", bash_cmd],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            stdin=stdin,
             text=True,
             env=env,
+            timeout=timeout if timeout > 0 else None,
+            check=False,
         )
-    except OSError as exc:
-        log_exception("whiptail execution failed", exc)
+    except subprocess.TimeoutExpired:
+        log_message("whiptail timed out (UI may be invisible — check TTY/sudo)", "ERROR")
         return 1, ""
-    selection = (result.stdout or "").strip()
-    return result.returncode, selection
+    return result.returncode, (result.stdout or "").strip()
+
+
+def test_whiptail_ui() -> bool:
+    """Return True if a whiptail dialog can be shown and dismissed."""
+    if not whiptail_available():
+        console_msg("whiptail binary not found.")
+        return False
+    code, _ = run_whiptail(
+        [
+            "--title",
+            "DBBackup",
+            "--msgbox",
+            "Whiptail UI test OK.\n\nPress OK to continue.",
+            "10",
+            "50",
+        ],
+        timeout=120,
+    )
+    return code == 0
+
+
+def enable_text_ui(reason: str) -> None:
+    """Switch all UI helpers to plain terminal prompts."""
+    global TEXT_UI_MODE
+    TEXT_UI_MODE = True
+    console_msg(f"Using text menu mode ({reason}).")
 
 
 def msg_box(title: str, message: str, height: int = 10, width: int = 70) -> None:
     """Display an informational message box."""
+    if TEXT_UI_MODE:
+        print(f"\n=== {title} ===\n{message}\n", flush=True)
+        try:
+            input("Press Enter to continue...")
+        except EOFError:
+            pass
+        return
     run_whiptail(
         [
             "--title",
@@ -212,6 +367,16 @@ def msg_box(title: str, message: str, height: int = 10, width: int = 70) -> None
 
 def yes_no(title: str, message: str, default: str = "yes") -> bool:
     """Display a yes/no dialog. Returns True for Yes."""
+    if TEXT_UI_MODE:
+        default_hint = "Y/n" if default == "yes" else "y/N"
+        print(f"\n=== {title} ===\n{message}\n", flush=True)
+        try:
+            answer = input(f"Yes or No? [{default_hint}]: ").strip().lower()
+        except EOFError:
+            return default == "yes"
+        if not answer:
+            return default == "yes"
+        return answer in ("y", "yes")
     code, _ = run_whiptail(
         [
             "--title",
@@ -233,6 +398,21 @@ def input_box(
     password: bool = False,
 ) -> Optional[str]:
     """Display a text input box. Returns None if cancelled."""
+    if TEXT_UI_MODE:
+        print(f"\n=== {title} ===", flush=True)
+        suffix = f" [{default}]" if default and not password else ""
+        try:
+            if password:
+                value = getpass.getpass(f"{prompt}{suffix}: ")
+            else:
+                value = input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            return None
+        if not value and default and not password:
+            return default
+        if value.lower() in ("q", "quit", "cancel") and not password:
+            return None
+        return value
     args = [
         "--title",
         title,
@@ -268,6 +448,27 @@ def menu(title: str, items: List[Tuple[str, str]], height: int = 20) -> Optional
     if not items:
         msg_box(title, "No items available.")
         return None
+    if TEXT_UI_MODE:
+        print(f"\n=== {title} ===", flush=True)
+        tags = []
+        for index, (tag, description) in enumerate(items, start=1):
+            tags.append(tag)
+            print(f"  {index}. {description}  [{tag}]", flush=True)
+        try:
+            raw = input("Enter number (or 'q' to cancel): ").strip().lower()
+        except EOFError:
+            return None
+        if raw in ("q", "quit", ""):
+            return None
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(tags):
+                return tags[idx]
+        for tag, _desc in items:
+            if raw == tag.lower() or raw == tag:
+                return tag
+        msg_box("Invalid", "Invalid selection.")
+        return None
     menu_args = ["--title", title, "--menu", "Select an option:", str(height), "70", "10"]
     for tag, description in items:
         menu_args.extend([tag, description])
@@ -289,6 +490,29 @@ def checklist(
     if not items:
         msg_box(title, "No databases available to select.")
         return None
+    if TEXT_UI_MODE:
+        print(f"\n=== {title} ===\n{prompt}\n", flush=True)
+        tags = []
+        for index, (tag, description, selected) in enumerate(items, start=1):
+            tags.append(tag)
+            mark = "x" if selected else " "
+            print(f"  {index}. [{mark}] {description}  ({tag})", flush=True)
+        try:
+            raw = input("Enter numbers separated by comma (or 'q' to cancel): ").strip()
+        except EOFError:
+            return None
+        if raw.lower() in ("q", "quit", ""):
+            return None
+        chosen: List[str] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(tags):
+                    chosen.append(tags[idx])
+            elif part in tags:
+                chosen.append(part)
+        return chosen
     args = ["--title", title, "--checklist", prompt, "20", "70", "10"]
     for tag, description, selected in items:
         state = "ON" if selected else "OFF"
@@ -314,6 +538,27 @@ def radiolist(
     items: List[Tuple[str, str, bool]],
 ) -> Optional[str]:
     """Display a radiolist. Returns selected tag or None."""
+    if TEXT_UI_MODE:
+        print(f"\n=== {title} ===\n{prompt}\n", flush=True)
+        tags = []
+        for index, (tag, description, selected) in enumerate(items, start=1):
+            tags.append(tag)
+            mark = "*" if selected else " "
+            print(f"  {index}. ({mark}) {description}  [{tag}]", flush=True)
+        try:
+            raw = input("Enter number (or 'q' to cancel): ").strip().lower()
+        except EOFError:
+            return None
+        if raw in ("q", "quit", ""):
+            return None
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(tags):
+                return tags[idx]
+        for tag in tags:
+            if raw == tag.lower() or raw == tag:
+                return tag
+        return None
     args = ["--title", title, "--radiolist", prompt, "12", "70", "6"]
     for tag, description, selected in items:
         state = "ON" if selected else "OFF"
@@ -331,6 +576,13 @@ def scroll_box(title: str, content: str) -> None:
     """Display scrollable text."""
     if not content.strip():
         content = "(empty)"
+    if TEXT_UI_MODE:
+        print(f"\n=== {title} ===\n{content}\n", flush=True)
+        try:
+            input("Press Enter to continue...")
+        except EOFError:
+            pass
+        return
     lines = content.count("\n") + 1
     height = min(max(lines + 2, 10), 30)
     run_whiptail(
@@ -2237,29 +2489,32 @@ def install_scheduler() -> None:
 
 
 def main_menu(skip_deps_check: bool = False) -> None:
-    """Display interactive whiptail main menu loop."""
+    """Display interactive main menu loop (whiptail or text fallback)."""
     console_msg("DBBackup - Enterprise Database Backup Manager")
 
     if not ensure_interactive_terminal():
         sys.exit(1)
 
-    if not whiptail_available():
-        console_msg("whiptail not found — installing dependencies...")
+    if os.environ.get("DBBACKUP_TEXT_UI") == "1":
+        enable_text_ui("DBBACKUP_TEXT_UI=1")
+    elif not whiptail_available():
+        console_msg("whiptail not installed — installing...")
         if os.geteuid() != 0:
-            console_msg("Run with sudo to install whiptail automatically.")
+            console_msg("Run with sudo, or use: --text-ui")
             sys.exit(1)
         install_dependencies(force_prompt=True, show_progress=True)
-    elif not skip_deps_check:
-        if not all_required_commands_available():
-            console_msg("Missing tools detected — installing...")
-            install_dependencies(force_prompt=True, show_progress=True)
-        elif not deps_recently_verified():
-            install_dependencies(force_prompt=True, show_progress=False)
+        if not whiptail_available():
+            enable_text_ui("whiptail not available after install")
+
+    if not skip_deps_check and not all_required_commands_available():
+        install_dependencies(force_prompt=True, show_progress=True)
+    elif not skip_deps_check and not deps_recently_verified():
+        install_dependencies(force_prompt=True, show_progress=False)
 
     console_msg("Opening menu...")
 
-    if not whiptail_available():
-        console_msg("ERROR: whiptail is still not available after install.")
+    if not whiptail_available() and not TEXT_UI_MODE:
+        console_msg("ERROR: No UI available.")
         sys.exit(1)
 
     while True:
@@ -2326,6 +2581,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Skip dependency check on startup (interactive mode)",
     )
+    parser.add_argument(
+        "--test-ui",
+        action="store_true",
+        help="Test whiptail UI and exit (diagnostics)",
+    )
+    parser.add_argument(
+        "--text-ui",
+        action="store_true",
+        help="Use plain text menus instead of whiptail",
+    )
     return parser.parse_args(argv)
 
 
@@ -2342,6 +2607,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             console_msg("Failed. See log: /opt/dbbackup/logs/dbbackup.log")
         return 0 if ok else 1
+
+    if args.test_ui:
+        console_msg("DBBackup UI diagnostic")
+        if not ensure_interactive_terminal():
+            return 1
+        if not whiptail_available():
+            console_msg("FAIL: whiptail not installed")
+            return 1
+        console_msg("Step 1/2: msgbox — you should see a dialog now...")
+        if not test_whiptail_ui():
+            console_msg("FAIL: msgbox test failed or timed out")
+            console_msg("Try: sudo -E python3 /opt/dbbackup/dbbackup.py --text-ui")
+            return 1
+        console_msg("Step 2/2: menu test...")
+        code, choice = run_whiptail(
+            [
+                "--title",
+                "Menu Test",
+                "--menu",
+                "Select option B:",
+                "12",
+                "50",
+                "2",
+                "a",
+                "Option A",
+                "b",
+                "Option B",
+            ],
+            timeout=120,
+        )
+        console_msg(f"Menu returned code={code} choice={choice!r}")
+        if code == 0 and choice == "b":
+            console_msg("PASS: whiptail UI fully working")
+            return 0
+        console_msg("FAIL: menu test did not return expected value")
+        return 1
+
+    if args.text_ui:
+        enable_text_ui("--text-ui flag")
 
     if args.run_scheduled:
         install_dependencies(force_prompt=False, show_progress=False)

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
+import html
 import json
 import os
 import re
@@ -54,6 +56,22 @@ DB_TYPES = {
     "postgresql": "PostgreSQL",
     "mysql": "MySQL/MariaDB",
     "mongodb": "MongoDB",
+}
+
+# Built-in system databases excluded from automatic "backup all" discovery and
+# from the manual selection list. Names are lowercase; matching is
+# case-insensitive.
+#   - MySQL: information_schema/performance_schema are virtual (mysqldump cannot
+#     dump them and errors out); sys is just auto-generated views. 'mysql' (users
+#     and grants) is intentionally kept as it holds real data.
+#   - MongoDB: admin/config are cluster metadata; local holds the oplog and must
+#     not be dumped.
+#   - PostgreSQL: templates are already excluded by the discovery query, and
+#     'postgres' may legitimately hold data, so nothing extra is filtered.
+SYSTEM_DATABASES: Dict[str, set] = {
+    "postgresql": set(),
+    "mysql": {"information_schema", "performance_schema", "sys"},
+    "mongodb": {"admin", "local", "config"},
 }
 
 APT_PACKAGES = {
@@ -585,16 +603,28 @@ def scroll_box(title: str, content: str) -> None:
         return
     lines = content.count("\n") + 1
     height = min(max(lines + 2, 10), 30)
-    run_whiptail(
-        [
-            "--title",
-            title,
-            "--scrollbox",
-            content,
-            str(height),
-            "78",
-        ]
-    )
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    try:
+        run_whiptail(
+            [
+                "--title",
+                title,
+                "--scrolltext",
+                "--textbox",
+                tmp_path,
+                str(height),
+                "78",
+            ]
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +658,11 @@ def save_config(config: Dict[str, Any]) -> bool:
         with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)
             handle.write("\n")
+        # Config stores plaintext DB passwords — restrict to owner only.
+        try:
+            os.chmod(CONFIG_FILE, 0o600)
+        except OSError:
+            pass
         return True
     except OSError as exc:
         log_exception("Failed to save config", exc)
@@ -1146,6 +1181,20 @@ def test_connection(conn: Dict[str, Any]) -> Tuple[bool, str]:
         return False, str(exc)
 
 
+def filter_system_databases(db_type: str, databases: List[str]) -> List[str]:
+    """
+    Remove built-in system databases that should never be backed up.
+
+    Applied to automatic discovery (backup-all) and to the manual selection
+    list. Matching is case-insensitive and order-preserving. For database types
+    with no excluded names (e.g. PostgreSQL) the list is returned unchanged.
+    """
+    system = SYSTEM_DATABASES.get(db_type, set())
+    if not system:
+        return list(databases)
+    return [db for db in databases if str(db).strip().lower() not in system]
+
+
 def discover_databases(conn: Dict[str, Any]) -> Tuple[bool, List[str], str]:
     """Discover databases on remote server. Returns (ok, databases, error)."""
     db_type = conn["database_type"]
@@ -1184,7 +1233,7 @@ def discover_databases(conn: Dict[str, Any]) -> Tuple[bool, List[str], str]:
             if result.returncode != 0:
                 return False, [], (result.stderr or result.stdout).strip()
             databases = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            return True, databases, ""
+            return True, filter_system_databases(db_type, databases), ""
 
         if db_type == "mysql":
             env["MYSQL_PWD"] = password
@@ -1211,7 +1260,7 @@ def discover_databases(conn: Dict[str, Any]) -> Tuple[bool, List[str], str]:
             if result.returncode != 0:
                 return False, [], (result.stderr or result.stdout).strip()
             databases = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            return True, databases, ""
+            return True, filter_system_databases(db_type, databases), ""
 
         if db_type == "mongodb":
             uri = (
@@ -1243,7 +1292,7 @@ def discover_databases(conn: Dict[str, Any]) -> Tuple[bool, List[str], str]:
                 databases = json.loads(raw)
             except json.JSONDecodeError:
                 databases = [line.strip() for line in raw.splitlines() if line.strip()]
-            return True, databases, ""
+            return True, filter_system_databases(db_type, databases), ""
 
         return False, [], f"Unsupported database type: {db_type}"
     except subprocess.TimeoutExpired:
@@ -1625,7 +1674,7 @@ def backup_one_database(
     prefix = job_backup_prefix(job)
     target_dir = category_directory(category)
     target_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = target_dir / f"{safe_db}_{ts}.{ext}"
+    backup_path = target_dir / f"{prefix}_{safe_db}_{ts}.{ext}"
 
     start = time.time()
     job_name = job.get("name", "unnamed")
@@ -1945,11 +1994,11 @@ def send_telegram_success(
     config = load_config()
     if not config.get("telegram", {}).get("enabled"):
         return
-    server = f"{job.get('host')}:{job.get('port')}"
+    server = html.escape(f"{job.get('host')}:{job.get('port')}")
     text = (
         "<b>Backup Success</b>\n"
         f"Server: {server}\n"
-        f"Database: {database}\n"
+        f"Database: {html.escape(str(database))}\n"
         f"Duration: {duration:.2f}s\n"
         f"Backup Size: {human_size(size_bytes)} ({size_bytes} bytes)"
     )
@@ -1967,12 +2016,12 @@ def send_telegram_failure(
     config = load_config()
     if not config.get("telegram", {}).get("enabled"):
         return
-    server = f"{job.get('host')}:{job.get('port')}"
+    server = html.escape(f"{job.get('host')}:{job.get('port')}")
     text = (
         "<b>Backup Failed</b>\n"
         f"Server: {server}\n"
-        f"Database: {database}\n"
-        f"Error: {error}"
+        f"Database: {html.escape(str(database))}\n"
+        f"Error: {html.escape(str(error))}"
     )
     ok, err = send_telegram_message(text, config)
     if not ok:

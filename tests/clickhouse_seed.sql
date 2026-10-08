@@ -1,0 +1,14 @@
+CREATE DATABASE `sales db`;
+CREATE TABLE `sales db`.orders (id UInt64, amount Decimal(10,2), d Date, note String DEFAULT 'x', amount_x2 Decimal(12,2) MATERIALIZED amount*2, label String ALIAS concat('o', toString(id))) ENGINE = MergeTree ORDER BY id;
+CREATE TABLE `sales db`.daily_to (d Date, total Decimal(38,2)) ENGINE = SummingMergeTree ORDER BY d;
+CREATE MATERIALIZED VIEW `sales db`.mv_daily ENGINE = SummingMergeTree ORDER BY d AS SELECT d, sum(amount) AS total FROM `sales db`.orders GROUP BY d;
+CREATE MATERIALIZED VIEW `sales db`.mv_to TO `sales db`.daily_to AS SELECT d, sum(amount) AS total FROM `sales db`.orders GROUP BY d;
+CREATE VIEW `sales db`.v_big AS SELECT * FROM `sales db`.orders WHERE amount > 500;
+CREATE TABLE `sales db`.`weird ``name` (k String, v Int32) ENGINE = Log;
+CREATE TABLE `sales db`.empty_mem (x UInt8) ENGINE = Memory;
+INSERT INTO `sales db`.orders (id, amount, d) SELECT number, (number % 1000) + 0.25, toDate('2026-01-01') + (number % 90) FROM numbers(200000);
+INSERT INTO `sales db`.orders (id, amount, d, note) SELECT 200000 + number, 1.5, toDate('2026-05-01'), 'tiếng Việt\ttab' FROM numbers(1000);
+INSERT INTO `sales db`.`weird ``name` VALUES ('a', 1), ('b"q', 2), ('c`t', 3);
+CREATE DATABASE analytics;
+CREATE TABLE analytics.events (ts DateTime, e LowCardinality(String), props Map(String, String), arr Array(Nullable(Int64))) ENGINE = ReplacingMergeTree ORDER BY ts;
+INSERT INTO analytics.events SELECT toDateTime('2026-01-01 00:00:00') + number, ['a','b','c'][number % 3 + 1], map('k', toString(number)), [number, NULL] FROM numbers(50000);

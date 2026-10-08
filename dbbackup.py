@@ -997,13 +997,46 @@ def deps_recently_verified(max_age_hours: int = 72) -> bool:
         return False
 
 
-def install_dependencies(force_prompt: bool = True, show_progress: bool = True) -> bool:
+def required_commands_for_jobs() -> Tuple[Dict[str, str], bool]:
+    """
+    Host packages the configured jobs actually need, and whether MongoDB tools are.
+
+    Unattended runs use this so a backup host only ever gets the clients for
+    the database types it backs up: no MySQL client or third-party MongoDB apt
+    repository appearing on, say, a mail server that backs up PostgreSQL.
+    ArangoDB and ClickHouse need no host package (their clients run from
+    Docker when not installed).
+    """
+    types = {job.get("database_type") for job in load_config().get("jobs", [])}
+    wanted = {"python3", "gzip", "zstd"}
+    if "postgresql" in types:
+        wanted.add("pg_dump")
+    if "mysql" in types:
+        wanted.add("mysqldump")
+    commands = {cmd: pkg for cmd, pkg in APT_PACKAGES.items() if cmd in wanted}
+    return commands, "mongodb" in types
+
+
+def install_dependencies(
+    force_prompt: bool = True,
+    show_progress: bool = True,
+    only_for_jobs: bool = False,
+) -> bool:
     """
     Detect and install missing required packages via apt.
     Requires root privileges.
+
+    With ``only_for_jobs`` (scheduled and --run-job runs) only the clients for
+    the configured jobs' database types are considered; the interactive menu
+    and --install-deps still install the full set.
     """
+    if only_for_jobs:
+        commands, mongodb_wanted = required_commands_for_jobs()
+    else:
+        commands, mongodb_wanted = dict(APT_PACKAGES), True
+
     missing_packages: List[str] = []
-    for command, package in APT_PACKAGES.items():
+    for command, package in commands.items():
         if command_exists(command):
             continue
         if package_installed(package):
@@ -1011,7 +1044,7 @@ def install_dependencies(force_prompt: bool = True, show_progress: bool = True) 
         if package not in missing_packages:
             missing_packages.append(package)
 
-    needs_mongodb = not mongodb_tools_available()
+    needs_mongodb = mongodb_wanted and not mongodb_tools_available()
 
     if not missing_packages and not needs_mongodb:
         mark_deps_verified()
@@ -4264,11 +4297,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_web_server(args.bind, args.port, args.tls_cert, args.tls_key)
 
     if args.run_scheduled:
-        install_dependencies(force_prompt=False, show_progress=False)
+        install_dependencies(force_prompt=False, show_progress=False, only_for_jobs=True)
         return run_all_backups()
 
     if args.run_job:
-        install_dependencies(force_prompt=False, show_progress=False)
+        install_dependencies(force_prompt=False, show_progress=False, only_for_jobs=True)
         if not acquire_lock():
             print("Backup already running.", file=sys.stderr)
             return 1

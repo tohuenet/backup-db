@@ -3,8 +3,8 @@
 DBBackup - Enterprise Database Backup Manager
 
 Single-file terminal application for managing PostgreSQL, MySQL/MariaDB,
-MongoDB, and ArangoDB backups on Ubuntu 22.04 LTS. Uses whiptail for UI and
-systemd timers for scheduling.
+MongoDB, ArangoDB and ClickHouse backups on Ubuntu 22.04+ LTS. Uses whiptail
+for UI and systemd timers for scheduling.
 """
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ DB_TYPES = {
     "mysql": "MySQL/MariaDB",
     "mongodb": "MongoDB",
     "arangodb": "ArangoDB",
+    "clickhouse": "ClickHouse",
 }
 
 # Built-in system databases excluded from automatic "backup all" discovery and
@@ -77,11 +78,14 @@ DB_TYPES = {
 #   - ArangoDB: _system holds users, graphs and Foxx services (server metadata);
 #     excluded from auto-discovery, but can still be backed up if selected
 #     manually.
+#   - ClickHouse: system and information_schema (both spellings) are virtual
+#     server metadata. 'default' is kept because it often holds real tables.
 SYSTEM_DATABASES: Dict[str, set] = {
     "postgresql": set(),
     "mysql": {"information_schema", "performance_schema", "sys"},
     "mongodb": {"admin", "local", "config"},
     "arangodb": {"_system"},
+    "clickhouse": {"system", "information_schema"},
 }
 
 APT_PACKAGES = {
@@ -134,6 +138,24 @@ MYSQL_DOCKER_IMAGE = "mysql:8"
 # tools image is not published on Docker Hub).
 MONGO_TOOLS_DOCKER_IMAGE = "mongo:7"
 DEFAULT_PG_IMAGE_MAJOR = 16
+# The server image bundles clickhouse-client. The native protocol is backward
+# compatible, so one recent LTS client talks to older servers; a per-job
+# "clickhouse_image" overrides it.
+CLICKHOUSE_DOCKER_IMAGE = "clickhouse/clickhouse-server:25.8"
+
+# ClickHouse engines whose rows are stored by ClickHouse itself and therefore
+# exported. Every other engine (View, MaterializedView, Dictionary,
+# Distributed, Kafka, S3, URL, MySQL, PostgreSQL, ...) is backed up as schema
+# only: its data is either derived or lives in another system.
+CLICKHOUSE_DATA_ENGINES = {
+    "Log", "TinyLog", "StripeLog", "Memory", "Set", "Join", "EmbeddedRocksDB",
+}
+
+# Refuse to start a dump when the backup filesystem has less free space than
+# this (GiB). Protects hosts that share the disk with other services (a full
+# root filesystem stops mail, databases, logging...). Override per install
+# with the top-level config key "min_free_gb".
+DEFAULT_MIN_FREE_GB = 20
 
 # Default retention (number of copies kept per category) for new jobs.
 DEFAULT_RETENTION: Dict[str, int] = {
@@ -1122,6 +1144,7 @@ def default_port(db_type: str) -> int:
         "mysql": 3306,
         "mongodb": 27017,
         "arangodb": 8529,
+        "clickhouse": 9000,
     }.get(db_type, 0)
 
 
@@ -1140,6 +1163,20 @@ def build_connection_info(
         "username": username.strip(),
         "password": password,
     }
+
+
+def job_connection(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Connection info for a saved job, carrying per-job client overrides."""
+    conn = build_connection_info(
+        job["database_type"],
+        job["host"],
+        job["port"],
+        job["username"],
+        job["password"],
+    )
+    if job.get("clickhouse_image"):
+        conn["clickhouse_image"] = job["clickhouse_image"]
+    return conn
 
 
 def arango_http_get(conn: Dict[str, Any], path: str, timeout: int = 30) -> Tuple[int, str]:
@@ -1281,6 +1318,13 @@ def test_connection(conn: Dict[str, Any]) -> Tuple[bool, str]:
                 return False, "Authentication failed (check username/password)"
             return False, f"ArangoDB returned HTTP {status}: {body.strip()[:200]}"
 
+        if db_type == "clickhouse":
+            result = clickhouse_query(conn, "SELECT 1", timeout=30)
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "Connection failed").strip()
+                return False, err
+            return True, ""
+
         return False, f"Unsupported database type: {db_type}"
     except subprocess.TimeoutExpired:
         return False, "Connection timed out"
@@ -1414,6 +1458,24 @@ def discover_databases(conn: Dict[str, Any]) -> Tuple[bool, List[str], str]:
                 return False, [], "Could not parse ArangoDB database list"
             return True, filter_system_databases(db_type, databases), ""
 
+        if db_type == "clickhouse":
+            result = clickhouse_query(
+                conn,
+                "SELECT name FROM system.databases ORDER BY name FORMAT JSONEachRow",
+                timeout=60,
+            )
+            if result.returncode != 0:
+                return False, [], (result.stderr or result.stdout).strip()
+            try:
+                databases = [
+                    json.loads(line)["name"]
+                    for line in result.stdout.splitlines()
+                    if line.strip()
+                ]
+            except (json.JSONDecodeError, KeyError):
+                return False, [], "Could not parse ClickHouse database list"
+            return True, filter_system_databases(db_type, databases), ""
+
         return False, [], f"Unsupported database type: {db_type}"
     except subprocess.TimeoutExpired:
         return False, [], "Discovery timed out"
@@ -1493,6 +1555,9 @@ def verify_backup(backup_path: Path, db_type: str) -> Tuple[bool, str]:
     name = backup_path.name
     if name.endswith(".tar.zst"):
         cmd = ["tar", "--zstd", "-tf", str(backup_path)]
+    elif name.endswith(".ch.tar"):
+        # ClickHouse: plain tar whose members are already zstd-compressed.
+        return verify_clickhouse_archive(backup_path)
     elif name.endswith(".tar.gz"):
         cmd = ["tar", "-tzf", str(backup_path)]
     elif name.endswith(".zst"):
@@ -1540,17 +1605,28 @@ def human_size(num_bytes: int) -> str:
 
 
 def directory_size(path: Path) -> int:
-    """Calculate total size of all files under a directory."""
+    """
+    Calculate disk usage of all files under a directory.
+
+    Hard links are counted once: a dump shared by the daily and weekly
+    categories occupies the disk once, so the store total must not double it.
+    """
     total = 0
     if not path.exists():
         return 0
+    seen = set()
     for root, _dirs, files in os.walk(path):
         for filename in files:
             file_path = Path(root) / filename
             try:
-                total += file_path.stat().st_size
+                st = file_path.stat()
             except OSError:
                 continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
     return total
 
 
@@ -1591,13 +1667,7 @@ def job_backup_prefix(job: Dict[str, Any]) -> str:
 def list_databases_for_job(job: Dict[str, Any]) -> List[str]:
     """Resolve database list for a job."""
     if job.get("backup_all", True):
-        conn = build_connection_info(
-            job["database_type"],
-            job["host"],
-            job["port"],
-            job["username"],
-            job["password"],
-        )
+        conn = job_connection(job)
         ok, databases, err = discover_databases(conn)
         if not ok:
             raise RuntimeError(f"Failed to discover databases: {err}")
@@ -1953,11 +2023,480 @@ def run_arangodump(
     )
 
 
+# ---------------------------------------------------------------------------
+# ClickHouse
+# ---------------------------------------------------------------------------
+#
+# A ClickHouse backup is a plain tar (".ch.tar") of one database:
+#
+#   manifest.json            tables, engines, column lists, restore order
+#   restore.py               self-contained restore script (see its docstring)
+#   schema/000_database.sql  CREATE DATABASE
+#   schema/<tier>_<n>.sql    one CREATE statement per table/view/dictionary
+#   data/<n>.native.zst      rows of every table that stores data, in
+#                            ClickHouse Native format, zstd-compressed
+#
+# Members are compressed individually, so the outer tar is not compressed
+# again. Everything goes over the native protocol with clickhouse-client, so
+# the backup host needs no access to the server's filesystem or a backup disk.
+# Tables are exported one by one: ClickHouse has no cross-table snapshot, so
+# each table is consistent on its own but tables are not frozen together.
+
+
+def clickhouse_host_client() -> Optional[List[str]]:
+    """Return the host clickhouse-client command, or None if not installed."""
+    if command_exists("clickhouse-client"):
+        return ["clickhouse-client"]
+    if command_exists("clickhouse"):
+        return ["clickhouse", "client"]
+    return None
+
+
+def clickhouse_quote_ident(name: str) -> str:
+    """Quote a ClickHouse identifier with backticks."""
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+
+def clickhouse_engine_has_data(engine: str) -> bool:
+    """True for engines whose rows are stored by ClickHouse and must be exported."""
+    return engine.endswith("MergeTree") or engine in CLICKHOUSE_DATA_ENGINES
+
+
+def clickhouse_restore_tier(engine: str) -> int:
+    """
+    Order in which objects are recreated on restore.
+
+    1 = tables holding data, 2 = other table engines (Distributed, Kafka, ...),
+    3 = dictionaries, 4 = views, 5 = materialized views. Materialized views
+    come last and are created only after the data is loaded (see restore.py),
+    otherwise reloading their source tables would fire them a second time.
+    """
+    if engine == "MaterializedView":
+        return 5
+    if engine in ("View", "LiveView", "WindowView"):
+        return 4
+    if engine == "Dictionary":
+        return 3
+    if clickhouse_engine_has_data(engine):
+        return 1
+    return 2
+
+
+class ClickHouseClient:
+    """
+    Run clickhouse-client against one server.
+
+    The username and password are written to a 0600 client config file rather
+    than passed on the command line, so the password never shows up in `ps` or
+    in Docker container metadata. The host client is used when installed;
+    otherwise the client runs from the ClickHouse Docker image with that config
+    file bind-mounted read-only.
+    """
+
+    def __init__(self, conn: Dict[str, Any]) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="dbbackup_ch_")
+        cfg = Path(self._tmp.name) / "client.xml"
+        fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(
+                "<config>\n"
+                f"  <user>{html.escape(conn['username'])}</user>\n"
+                f"  <password>{html.escape(conn['password'])}</password>\n"
+                "</config>\n"
+            )
+        host_cmd = clickhouse_host_client()
+        if host_cmd:
+            base = host_cmd + ["--config-file", str(cfg)]
+        elif docker_available():
+            image = conn.get("clickhouse_image") or CLICKHOUSE_DOCKER_IMAGE
+            ensure_docker_image(image)
+            base = docker_run_prefix(
+                image,
+                volumes={self._tmp.name: "/dbbackup-ch:ro"},
+                entrypoint="clickhouse-client",
+            ) + ["--config-file", "/dbbackup-ch/client.xml"]
+        else:
+            self._tmp.cleanup()
+            raise RuntimeError("No clickhouse-client on host and Docker is unavailable")
+        self.base = base + ["--host", conn["host"], "--port", str(conn["port"])]
+
+    def __enter__(self) -> "ClickHouseClient":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self._tmp.cleanup()
+
+    def command(self, query: str, params: Optional[Dict[str, str]] = None) -> List[str]:
+        """Build a client command; ``params`` fill {name:String} placeholders."""
+        cmd = list(self.base) + ["--query", query]
+        for key, value in (params or {}).items():
+            cmd.append(f"--param_{key}={value}")
+        return cmd
+
+    def query(
+        self,
+        query: str,
+        params: Optional[Dict[str, str]] = None,
+        timeout: int = 300,
+    ) -> subprocess.CompletedProcess:
+        """Run a query and capture its text output."""
+        return subprocess.run(
+            self.command(query, params),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def json_rows(
+        self,
+        query: str,
+        params: Optional[Dict[str, str]] = None,
+        timeout: int = 300,
+    ) -> List[Dict[str, Any]]:
+        """Run a query and return its rows as dicts (raises on failure)."""
+        result = self.query(f"{query} FORMAT JSONEachRow", params, timeout)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "query failed").strip())
+        return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def clickhouse_query(
+    conn: Dict[str, Any], query: str, timeout: int = 60
+) -> subprocess.CompletedProcess:
+    """One-off query used by the connection test and database discovery."""
+    try:
+        with ClickHouseClient(conn) as client:
+            return client.query(query, timeout=timeout)
+    except RuntimeError as exc:
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=str(exc))
+
+
+def clickhouse_export_table(
+    client: ClickHouseClient, query: str, output_path: Path
+) -> None:
+    """Stream one SELECT ... FORMAT Native through zstd into output_path."""
+    with open(output_path, "wb") as outfile:
+        comp = subprocess.Popen(compressor_command(), stdin=subprocess.PIPE, stdout=outfile)
+        assert comp.stdin is not None
+        dump = subprocess.Popen(
+            client.command(query), stdout=comp.stdin, stderr=subprocess.PIPE
+        )
+        comp.stdin.close()
+        dump_stderr = dump.communicate()[1]
+        comp_rc = comp.wait()
+    if dump.returncode != 0:
+        err = (dump_stderr or b"export failed").decode(errors="replace")
+        raise RuntimeError(err.strip())
+    if comp_rc != 0:
+        raise RuntimeError("zstd compression failed")
+    check = subprocess.run(
+        ["zstd", "-t", "-q", str(output_path)], capture_output=True, text=True, check=False
+    )
+    if check.returncode != 0:
+        raise RuntimeError(f"zstd test failed for {output_path.name}: {check.stderr.strip()}")
+
+
+CLICKHOUSE_RESTORE_SCRIPT = r'''#!/usr/bin/env python3
+"""
+Restore a DBBackup ClickHouse archive.
+
+    mkdir restore && tar -xf <backup>.ch.tar -C restore
+    python3 restore/restore.py [clickhouse-client options]
+
+    e.g. python3 restore/restore.py --host 127.0.0.1 --port 9000 \
+             --user default --password '...'
+
+Needs clickhouse-client and zstd on PATH. The database is recreated under its
+original name (CREATE statements reference it), so restore into a server or
+database name that does not hold these tables yet.
+
+Order: database, tables, other engines, dictionaries, views, table data,
+materialized views, then the data of materialized views' inner tables.
+Materialized views are created only after their source tables are loaded so
+the reload does not fire them and duplicate rows in their targets.
+"""
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CLIENT = ["clickhouse-client"] + sys.argv[1:]
+
+
+def q(name):
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+
+def run_sql(path):
+    sql = (HERE / path).read_text(encoding="utf-8").strip().rstrip(";")
+    subprocess.run(CLIENT + ["--query", sql], check=True)
+
+
+def load(database, table, columns, data_file):
+    cols = ", ".join(q(c) for c in columns)
+    query = f"INSERT INTO {q(database)}.{q(table)} ({cols}) FORMAT Native"
+    dec = subprocess.Popen(["zstd", "-dc", str(HERE / data_file)], stdout=subprocess.PIPE)
+    # An empty table exports zero bytes, and ClickHouse rejects an INSERT
+    # without data (NO_DATA_TO_INSERT), so peek before starting the insert.
+    first = dec.stdout.read(1 << 16)
+    if not first:
+        dec.stdout.close()
+        if dec.wait() != 0:
+            sys.exit(f"cannot decompress {data_file}")
+        return
+    ins = subprocess.Popen(CLIENT + ["--query", query], stdin=subprocess.PIPE)
+    try:
+        ins.stdin.write(first)
+        shutil.copyfileobj(dec.stdout, ins.stdin, 1 << 20)
+    except BrokenPipeError:
+        pass  # the client exited early; its return code reports why
+    finally:
+        ins.stdin.close()
+        dec.stdout.close()
+    if dec.wait() != 0 or ins.wait() != 0:
+        sys.exit(f"failed to load {database}.{table} from {data_file}")
+
+
+def inner_table(database, view):
+    query = (
+        "SELECT name FROM system.tables WHERE database = {db:String} AND ("
+        "name = concat('.inner_id.', toString((SELECT uuid FROM system.tables "
+        "WHERE database = {db:String} AND name = {mv:String}))) "
+        "OR name = concat('.inner.', {mv:String}))"
+    )
+    out = subprocess.run(
+        CLIENT + ["--query", query, f"--param_db={database}", f"--param_mv={view}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    if len(out) != 1:
+        sys.exit(f"cannot find the inner table of materialized view {view}")
+    return out[0]
+
+
+def main():
+    manifest = json.loads((HERE / "manifest.json").read_text(encoding="utf-8"))
+    database = manifest["database"]
+    tables = manifest["tables"]
+    run_sql("schema/000_database.sql")
+    for tier in (1, 2, 3, 4):
+        for t in tables:
+            if t.get("tier") == tier:
+                run_sql(t["schema_file"])
+    for t in tables:
+        if t.get("data_file") and not t.get("inner_of"):
+            load(database, t["name"], t["columns"], t["data_file"])
+    for t in tables:
+        if t.get("tier") == 5:
+            run_sql(t["schema_file"])
+    for t in tables:
+        if t.get("inner_of"):
+            load(database, inner_table(database, t["inner_of"]), t["columns"], t["data_file"])
+    print(f"restored {database}: {len(tables)} objects")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def run_clickhouse_dump(conn: Dict[str, Any], database: str, output_tar: Path) -> None:
+    """
+    Dump one ClickHouse database into a .ch.tar archive (layout above).
+
+    Work happens in a hidden staging directory beside the final archive (same
+    filesystem, so no /tmp size limit) and tar --remove-files drops each member
+    once archived, keeping peak usage close to one copy of the dump.
+    """
+    staging = output_tar.parent / f".staging_{output_tar.name}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    (staging / "schema").mkdir(parents=True)
+    (staging / "data").mkdir()
+    try:
+        with ClickHouseClient(conn) as ch:
+            params = {"db": database}
+            server_version = ch.json_rows("SELECT version() AS v")[0]["v"]
+            db_stmt = ch.json_rows(
+                f"SHOW CREATE DATABASE {clickhouse_quote_ident(database)}"
+            )[0]["statement"]
+            tables = ch.json_rows(
+                "SELECT name, engine, create_table_query, toString(uuid) AS uuid, "
+                "total_rows FROM system.tables "
+                "WHERE database = {db:String} AND NOT is_temporary ORDER BY name",
+                params,
+            )
+
+            # Inner tables of materialized views (".inner_id.<uuid>" in Atomic
+            # databases, ".inner.<view>" in Ordinary ones) are created by the
+            # view itself, so only their data is kept, tied to the view name.
+            inner_owner: Dict[str, str] = {}
+            for t in tables:
+                if t["engine"] == "MaterializedView":
+                    inner_owner[f".inner_id.{t['uuid']}"] = t["name"]
+                    inner_owner[f".inner.{t['name']}"] = t["name"]
+
+            (staging / "schema" / "000_database.sql").write_text(
+                re.sub(r"^CREATE DATABASE ", "CREATE DATABASE IF NOT EXISTS ", db_stmt, count=1)
+                + ";\n",
+                encoding="utf-8",
+            )
+
+            entries: List[Dict[str, Any]] = []
+            ordered = sorted(
+                tables, key=lambda r: (clickhouse_restore_tier(r["engine"]), r["name"])
+            )
+            for seq, t in enumerate(ordered, start=1):
+                name, engine = t["name"], t["engine"]
+                entry: Dict[str, Any] = {
+                    "name": name,
+                    "engine": engine,
+                    "total_rows": t.get("total_rows"),
+                }
+                if name in inner_owner:
+                    entry["inner_of"] = inner_owner[name]
+                else:
+                    tier = clickhouse_restore_tier(engine)
+                    schema_file = f"schema/{tier}_{seq:04d}.sql"
+                    (staging / schema_file).write_text(
+                        t["create_table_query"].rstrip().rstrip(";") + ";\n",
+                        encoding="utf-8",
+                    )
+                    entry["tier"] = tier
+                    entry["schema_file"] = schema_file
+
+                if clickhouse_engine_has_data(engine):
+                    # Only stored columns: ALIAS/MATERIALIZED/EPHEMERAL ones are
+                    # recomputed by the server on insert.
+                    columns = [
+                        c["name"]
+                        for c in ch.json_rows(
+                            "SELECT name FROM system.columns "
+                            "WHERE database = {db:String} AND table = {t:String} "
+                            "AND default_kind IN ('', 'DEFAULT') ORDER BY position",
+                            {"db": database, "t": name},
+                        )
+                    ]
+                    data_file = f"data/{seq:04d}.native.zst"
+                    select = (
+                        "SELECT "
+                        + ", ".join(clickhouse_quote_ident(c) for c in columns)
+                        + f" FROM {clickhouse_quote_ident(database)}."
+                        + f"{clickhouse_quote_ident(name)} FORMAT Native"
+                    )
+                    clickhouse_export_table(ch, select, staging / data_file)
+                    entry["columns"] = columns
+                    entry["data_file"] = data_file
+                entries.append(entry)
+
+        manifest = {
+            "format": "dbbackup-clickhouse/1",
+            "database": database,
+            "server_version": server_version,
+            "created": iso_timestamp(),
+            "tables": entries,
+        }
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        restore = staging / "restore.py"
+        restore.write_text(CLICKHOUSE_RESTORE_SCRIPT, encoding="utf-8")
+        os.chmod(restore, 0o755)
+
+        result = subprocess.run(
+            ["tar", "-cf", str(output_tar), "--remove-files", "-C", str(staging),
+             "manifest.json", "restore.py", "schema", "data"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or "tar archive failed").strip())
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def verify_clickhouse_archive(backup_path: Path) -> Tuple[bool, str]:
+    """A ClickHouse archive must list cleanly and carry its manifest and restore script."""
+    result = subprocess.run(
+        ["tar", "-tf", str(backup_path)], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        return False, (result.stderr or "tar listing failed").strip()
+    members = set(result.stdout.split())
+    missing = {"manifest.json", "restore.py"} - members
+    if missing:
+        return False, f"archive is missing {', '.join(sorted(missing))}"
+    return True, ""
+
+
 def backup_extension(db_type: str) -> str:
     """Return backup file extension for database type."""
     if db_type in ("mongodb", "arangodb"):
         return "tar.zst"
+    if db_type == "clickhouse":
+        return "ch.tar"
     return "sql.zst"
+
+
+def min_free_bytes() -> int:
+    """Free-space floor for the backup filesystem (config "min_free_gb")."""
+    try:
+        gb = float(load_config().get("min_free_gb", DEFAULT_MIN_FREE_GB))
+    except (TypeError, ValueError):
+        gb = DEFAULT_MIN_FREE_GB
+    return int(max(gb, 0) * 1024 ** 3)
+
+
+def ensure_free_space(target_dir: Path) -> None:
+    """Raise before dumping when the backup filesystem is below the floor."""
+    floor = min_free_bytes()
+    free = shutil.disk_usage(target_dir).free
+    if free < floor:
+        raise RuntimeError(
+            f"Not enough free space on {target_dir}: {human_size(free)} free, "
+            f"need at least {human_size(floor)} (config min_free_gb)"
+        )
+
+
+def link_or_copy(source: Path, dest: Path) -> None:
+    """Hard-link source to dest (same filesystem); fall back to a copy."""
+    try:
+        os.link(source, dest)
+    except OSError:
+        shutil.copy2(source, dest)
+
+
+def reuse_backup(
+    job: Dict[str, Any],
+    database: str,
+    db_type: str,
+    source: Path,
+    backup_path: Path,
+    moment: datetime,
+) -> int:
+    """
+    Publish an already-verified dump from this run under another category.
+
+    On days that are daily+weekly (+monthly...) the database is dumped once and
+    the other categories get a hard link, instead of re-running the dump
+    against the server. Retention deletes one link at a time, so each category
+    still keeps its own copy count. Returns the size of the published file.
+    """
+    link_or_copy(source, backup_path)
+    # Same bytes as the source, whose digest was computed right after its dump;
+    # re-hashing a multi-hundred-GB file here would only cost another full read.
+    try:
+        digest = Path(f"{source}.sha256").read_text(encoding="utf-8").split()[0]
+    except (OSError, IndexError):
+        digest = sha256_file(backup_path)
+    Path(f"{backup_path}.sha256").write_text(
+        f"{digest}  {backup_path.name}\n", encoding="utf-8"
+    )
+    write_metadata(backup_path, database, db_type, digest, job, moment)
+    return backup_path.stat().st_size
 
 
 def backup_one_database(
@@ -1965,19 +2504,17 @@ def backup_one_database(
     database: str,
     category: str,
     when: Optional[datetime] = None,
-) -> Tuple[bool, str, int, float]:
+    reuse_from: Optional[Path] = None,
+) -> Tuple[bool, str, int, float, Optional[Path]]:
     """
     Backup a single database for one category.
-    Returns (success, error_message, size_bytes, duration_seconds).
+
+    With ``reuse_from`` (a dump of the same database made earlier in this run)
+    the file is linked instead of dumped again.
+    Returns (success, error_message, size_bytes, duration_seconds, path).
     """
     moment = when or datetime.now()
-    conn = build_connection_info(
-        job["database_type"],
-        job["host"],
-        job["port"],
-        job["username"],
-        job["password"],
-    )
+    conn = job_connection(job)
     db_type = job["database_type"]
     ext = backup_extension(db_type)
     ts = timestamp_str(moment)
@@ -1989,12 +2526,32 @@ def backup_one_database(
 
     start = time.time()
     job_name = job.get("name", "unnamed")
+
+    if reuse_from is not None:
+        try:
+            size_bytes = reuse_backup(job, database, db_type, reuse_from, backup_path, moment)
+            duration = time.time() - start
+            log_message(
+                f"Backup reused | job={job_name} | db={database} | category={category} | "
+                f"from={reuse_from.parent.name}/{reuse_from.name} | file={backup_path.name}"
+            )
+            return True, "", size_bytes, duration, backup_path
+        except Exception as exc:
+            # Fall through to a fresh dump rather than lose this category.
+            if backup_path.exists():
+                delete_backup_artifacts(backup_path)
+            log_exception(
+                f"Backup reuse failed, dumping again | job={job_name} | db={database}", exc
+            )
+            start = time.time()
+
     log_message(
         f"Starting backup | job={job_name} | db={database} | "
         f"category={category} | host={job.get('host')}"
     )
 
     try:
+        ensure_free_space(target_dir)
         if db_type == "postgresql":
             run_pg_dump(conn, database, backup_path)
         elif db_type == "mysql":
@@ -2003,6 +2560,8 @@ def backup_one_database(
             run_mongodump(conn, database, backup_path)
         elif db_type == "arangodb":
             run_arangodump(conn, database, backup_path, job.get("arango_image"))
+        elif db_type == "clickhouse":
+            run_clickhouse_dump(conn, database, backup_path)
         else:
             raise RuntimeError(f"Unsupported database type: {db_type}")
 
@@ -2016,7 +2575,7 @@ def backup_one_database(
                 "ERROR",
             )
             send_telegram_failure(job, database, verr)
-            return False, verr, 0, duration
+            return False, verr, 0, duration, None
 
         digest = write_sha256_sidecar(backup_path)
         write_metadata(backup_path, database, db_type, digest, job, moment)
@@ -2028,7 +2587,7 @@ def backup_one_database(
             f"size={size_bytes} | file={backup_path.name}"
         )
         send_telegram_success(job, database, duration, size_bytes)
-        return True, "", size_bytes, duration
+        return True, "", size_bytes, duration, backup_path
     except Exception as exc:
         duration = time.time() - start
         if backup_path.exists():
@@ -2039,23 +2598,18 @@ def backup_one_database(
             exc,
         )
         send_telegram_failure(job, database, err)
-        return False, err, 0, duration
+        return False, err, 0, duration, None
 
 
 def backup_postgresql_globals(
     job: Dict[str, Any],
     category: str,
     when: Optional[datetime] = None,
-) -> Tuple[bool, str, int, float]:
-    """Backup PostgreSQL global roles separately."""
+    reuse_from: Optional[Path] = None,
+) -> Tuple[bool, str, int, float, Optional[Path]]:
+    """Backup PostgreSQL global roles separately (linked when ``reuse_from``)."""
     moment = when or datetime.now()
-    conn = build_connection_info(
-        job["database_type"],
-        job["host"],
-        job["port"],
-        job["username"],
-        job["password"],
-    )
+    conn = job_connection(job)
     ts = timestamp_str(moment)
     prefix = job_backup_prefix(job)
     target_dir = category_directory(category)
@@ -2065,14 +2619,26 @@ def backup_postgresql_globals(
     job_name = job.get("name", "unnamed")
     database = "globals"
 
+    if reuse_from is not None:
+        try:
+            size_bytes = reuse_backup(
+                job, database, "postgresql", reuse_from, backup_path, moment
+            )
+            return True, "", size_bytes, time.time() - start, backup_path
+        except Exception as exc:
+            if backup_path.exists():
+                delete_backup_artifacts(backup_path)
+            log_exception(f"Globals reuse failed, dumping again | job={job_name}", exc)
+
     try:
+        ensure_free_space(target_dir)
         run_pg_globals(conn, backup_path)
         ok, verr = verify_backup(backup_path, "postgresql")
         if not ok:
             delete_backup_artifacts(backup_path)
             duration = time.time() - start
             send_telegram_failure(job, database, verr)
-            return False, verr, 0, duration
+            return False, verr, 0, duration, None
         digest = write_sha256_sidecar(backup_path)
         write_metadata(backup_path, database, "postgresql", digest, job, moment)
         size_bytes = backup_path.stat().st_size
@@ -2082,7 +2648,7 @@ def backup_postgresql_globals(
             f"size={size_bytes}"
         )
         send_telegram_success(job, database, duration, size_bytes)
-        return True, "", size_bytes, duration
+        return True, "", size_bytes, duration, backup_path
     except Exception as exc:
         duration = time.time() - start
         if backup_path.exists():
@@ -2090,7 +2656,7 @@ def backup_postgresql_globals(
         err = str(exc)
         log_exception(f"Globals backup failed | job={job_name}", exc)
         send_telegram_failure(job, database, err)
-        return False, err, 0, duration
+        return False, err, 0, duration, None
 
 
 def backup_path_from_meta(meta_path: Path) -> Path:
@@ -2235,34 +2801,46 @@ def run_job_backups(
         send_telegram_failure(job, "all", err)
         return summary
 
+    # Each database is dumped once per run; further categories of the same run
+    # (weekly on Sunday, monthly on the 1st...) reuse that dump via a hard link.
+    # Re-dumping a large production database two or three times in one night
+    # only adds load to the server. Reused copies do not count toward
+    # total_size, which reports data actually transferred and written.
+    # Keyed by (is_globals, name) so a database literally named "globals" does
+    # not collide with the PostgreSQL globals dump.
+    first_dump: Dict[Tuple[bool, str], Path] = {}
+
+    def record(
+        category: str, database: str, key: Tuple[bool, str], outcome: Tuple[Any, ...]
+    ) -> None:
+        ok, err, size, duration, path = outcome
+        reused = ok and key in first_dump
+        if ok and path is not None and key not in first_dump:
+            first_dump[key] = path
+        summary["results"].append(
+            {"category": category, "database": database, "ok": ok,
+             "size": size, "duration": duration, "error": err, "reused": reused}
+        )
+        if ok:
+            summary["success"] += 1
+            if not reused:
+                summary["total_size"] += size
+        else:
+            summary["failed"] += 1
+            summary["errors"].append(err)
+
     for category in cats:
         if job.get("database_type") == "postgresql":
-            ok, err, size, duration = backup_postgresql_globals(job, category, moment)
-            summary["results"].append(
-                {"category": category, "database": "globals", "ok": ok,
-                 "size": size, "duration": duration, "error": err}
-            )
-            if ok:
-                summary["success"] += 1
-                summary["total_size"] += size
-            else:
-                summary["failed"] += 1
-                summary["errors"].append(err)
+            key = (True, "globals")
+            record(category, "globals", key, backup_postgresql_globals(
+                job, category, moment, reuse_from=first_dump.get(key)
+            ))
 
         for database in databases:
-            ok, err, size, duration = backup_one_database(
-                job, database, category, moment
-            )
-            summary["results"].append(
-                {"category": category, "database": database, "ok": ok,
-                 "size": size, "duration": duration, "error": err}
-            )
-            if ok:
-                summary["success"] += 1
-                summary["total_size"] += size
-            else:
-                summary["failed"] += 1
-                summary["errors"].append(err)
+            key = (False, database)
+            record(category, database, key, backup_one_database(
+                job, database, category, moment, reuse_from=first_dump.get(key)
+            ))
 
     apply_retention(job)
     end = datetime.now()
@@ -2664,6 +3242,7 @@ def prompt_connection(existing: Optional[Dict[str, Any]] = None) -> Optional[Dic
                 ("mysql", "MySQL/MariaDB"),
                 ("mongodb", "MongoDB"),
                 ("arangodb", "ArangoDB"),
+                ("clickhouse", "ClickHouse (native protocol)"),
             ],
         )
         if not choice:
@@ -3058,6 +3637,7 @@ User=root
 Group=root
 Nice=10
 IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 StandardOutput=journal
 StandardError=journal
 
@@ -3068,9 +3648,11 @@ WantedBy=multi-user.target
 
 def systemd_timer_content() -> str:
     """Return dbbackup.timer unit file contents."""
+    # No Requires=dbbackup.service here: a timer that Requires its service
+    # pulls the service in whenever the timer starts, i.e. a full backup run at
+    # every boot. Unit= alone is what links the timer to the service.
     return """[Unit]
 Description=DBBackup daily backup timer
-Requires=dbbackup.service
 
 [Timer]
 OnCalendar=*-*-* 02:00:00

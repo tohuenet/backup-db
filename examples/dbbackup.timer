@@ -1,6 +1,5 @@
 [Unit]
 Description=DBBackup daily backup timer
-Requires=dbbackup.service
 
 [Timer]
 OnCalendar=*-*-* 02:00:00

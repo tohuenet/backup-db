@@ -1,10 +1,10 @@
 # DBBackup Installation Guide
 
-Enterprise Database Backup Manager for **Ubuntu 22.04 LTS**.
+Enterprise Database Backup Manager for **Ubuntu 22.04 LTS or newer**.
 
 ## Requirements
 
-- Ubuntu 22.04 LTS
+- Ubuntu 22.04 LTS or newer
 - Root or sudo access
 - Network access to target database servers
 - Terminal with whiptail support
@@ -85,7 +85,8 @@ Created automatically on first run:
 ├── backups/
 │   ├── daily/
 │   ├── weekly/
-│   └── monthly/
+│   ├── monthly/
+│   └── yearly/
 └── logs/
     └── dbbackup.log
 ```
@@ -110,9 +111,24 @@ Ensure the backup user has `SELECT`, `SHOW VIEW`, `TRIGGER`, and `EVENT` privile
 
 Ensure the backup user can authenticate against the `admin` database and has read access to target databases. The application uses `mongosh` with fallback to legacy `mongo`.
 
+### ClickHouse
+
+Backups use `clickhouse-client` over the **native protocol** (default port 9000). If `clickhouse-client` (or the single `clickhouse` binary) is not installed, the client runs from the `clickhouse/clickhouse-server` Docker image, so the backup host only needs Docker. Override the image per job with `"clickhouse_image"`.
+
+The backup user needs read access to the data and metadata:
+
+```sql
+CREATE USER backup_user IDENTIFIED BY '...';
+GRANT SELECT, SHOW ON *.* TO backup_user;
+```
+
 ## Firewall
 
-Allow outbound connections from the backup server to remote database hosts on the configured ports (5432, 3306, 27017 by default).
+Allow outbound connections from the backup server to remote database hosts on the configured ports (5432, 3306, 27017, 8529, 9000 by default).
+
+## Free-space floor
+
+A dump does not start when the backup filesystem has less than `min_free_gb` GiB free (top-level key in `config.json`, default 20). It fails with a clear error instead of filling the disk, which matters when the backup host also runs other services.
 
 ## Telegram (Optional)
 
@@ -137,7 +153,8 @@ journalctl -u dbbackup.service
 ## Security Notes
 
 - Passwords are stored in plaintext in `config.json`
-- No restore functionality is provided (intentional)
+- No restore menu is provided (intentional). SQL dumps restore with `psql`/`mysql`; each ClickHouse archive carries its own `restore.py` (see USAGE.md)
+- ClickHouse credentials are passed to `clickhouse-client` through a temporary 0600 config file, never on the command line
 - Restrict file permissions on `/opt/dbbackup/config.json`:
 
 ```bash

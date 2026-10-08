@@ -1,4 +1,5 @@
 {
+  "min_free_gb": 20,
   "telegram": {
     "enabled": true,
     "bot_token": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz",
@@ -19,9 +20,10 @@
         "billing"
       ],
       "retention": {
-        "daily_days": 14,
-        "weekly_weeks": 8,
-        "monthly_months": 12
+        "daily_count": 7,
+        "weekly_count": 4,
+        "monthly_count": 6,
+        "yearly_count": 1
       }
     },
     {
@@ -35,9 +37,10 @@
       "backup_all": true,
       "databases": [],
       "retention": {
-        "daily_days": 14,
-        "weekly_weeks": 8,
-        "monthly_months": 12
+        "daily_count": 7,
+        "weekly_count": 4,
+        "monthly_count": 6,
+        "yearly_count": 1
       }
     },
     {
@@ -51,9 +54,28 @@
       "backup_all": true,
       "databases": [],
       "retention": {
-        "daily_days": 14,
-        "weekly_weeks": 8,
-        "monthly_months": 12
+        "daily_count": 7,
+        "weekly_count": 4,
+        "monthly_count": 6,
+        "yearly_count": 1
+      }
+    },
+    {
+      "id": "d4e5f6a7-b8c9-0123-def0-234567890123",
+      "name": "Analytics ClickHouse",
+      "database_type": "clickhouse",
+      "host": "clickhouse.example.com",
+      "port": 9000,
+      "username": "backup_user",
+      "password": "plaintext_password_here",
+      "backup_all": true,
+      "databases": [],
+      "clickhouse_image": "clickhouse/clickhouse-server:25.8",
+      "retention": {
+        "daily_count": 7,
+        "weekly_count": 4,
+        "monthly_count": 6,
+        "yearly_count": 1
       }
     }
   ]
